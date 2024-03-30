@@ -9,6 +9,8 @@ import keras_cv
 from keras_cv import bounding_box
 from keras_cv import visualization
 
+from CocometricCallback import EvaluateCOCOMetricsCallback
+
 SPLIT_RATIO = 0.2
 BATCH_SIZE = 4
 LEARNING_RATE = 0.001
@@ -16,7 +18,7 @@ EPOCH = 5
 GLOBAL_CLIPNORM = 10.0
 
 labels = ['Blobs', 'Cracking-warping', 'Spaghetti', 'Stringging', 'Under Extrusion']
-
+class_mapping = dict(zip(range(len(labels)), labels))
 
 def parse_file(txtfile):
     file_name = os.path.splitext(os.path.basename(txtfile))[0]
@@ -94,6 +96,11 @@ train_image_paths = tf.ragged.constant(train_image_paths)
 
 train_data = tf.data.Dataset.from_tensor_slices((train_image_paths, train_classes, train_bbox))
 
+train_ds = train_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.shuffle(BATCH_SIZE * 4)
+train_ds = train_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+
+
 valid_image_paths = []
 valid_bbox = []
 valid_classes = []
@@ -108,6 +115,10 @@ valid_classes = tf.ragged.constant(valid_classes)
 valid_image_paths = tf.ragged.constant(valid_image_paths)
 
 valid_data = tf.data.Dataset.from_tensor_slices((valid_image_paths, valid_classes, valid_bbox))
+
+valid_ds = valid_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+valid_ds = valid_ds.shuffle(BATCH_SIZE * 4)
+valid_ds = valid_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
 
 test_image_paths = []
 test_bbox = []
@@ -124,4 +135,33 @@ test_image_paths = tf.ragged.constant(test_image_paths)
 
 test_data = tf.data.Dataset.from_tensor_slices((test_image_paths, test_classes, test_bbox))
 
+test_ds = test_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+test_ds = test_ds.shuffle(BATCH_SIZE * 4)
+test_ds = test_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
 
+backbone = keras_cv.models.YOLOV8Backbone.from_preset(
+    "yolo_v8_s_backbone"  # We will use yolov8 small backbone with coco weights
+)
+
+yolo = keras_cv.models.YOLOV8Detector(
+    num_classes=len(class_mapping),
+    bounding_box_format="xyxy",
+    backbone=backbone,
+    fpn_depth=1,
+)
+
+optimizer = tf.keras.optimizers.Adam(
+    learning_rate=LEARNING_RATE,
+    global_clipnorm=GLOBAL_CLIPNORM,
+)
+
+yolo.compile(
+    optimizer=optimizer, classification_loss="binary_crossentropy", box_loss="ciou"
+)
+
+yolo.fit(
+    train_ds,
+    validation_data=valid_ds,
+    epochs=30,
+    callbacks=[EvaluateCOCOMetricsCallback(valid_ds, "model.h5")],
+)
