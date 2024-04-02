@@ -1,31 +1,34 @@
 import os
-from tqdm.auto import tqdm
 import xml.etree.ElementTree as ET
-
 import tensorflow as tf
-from tensorflow import keras
-
 import keras_cv
+import requests
+import zipfile
+
+from tqdm.auto import tqdm
+from tensorflow import keras
 from keras_cv import bounding_box
 from keras_cv import visualization
 
 from CocometricCallback import EvaluateCOCOMetricsCallback
 
 SPLIT_RATIO = 0.2
-BATCH_SIZE = 4
+BATCH_SIZE = 8
 LEARNING_RATE = 0.001
-EPOCH = 5
+EPOCH = 75
 GLOBAL_CLIPNORM = 10.0
 
-labels = ['Blobs', 'Cracking-warping', 'Spaghetti', 'Stringging', 'Under Extrusion']
-class_mapping = dict(zip(range(len(labels)), labels))
+class_ids = ['Blobs', 'Cracking-warping', 'Spaghetti', 'Stringging', 'Under Extrusion']
+class_mapping = dict(zip(range(len(class_ids)), class_ids))
 
-def parse_file(txtfile):
-    file_name = os.path.splitext(os.path.basename(txtfile))[0]
-    head, tail = os.path.split(txtfile)
-    elements = head.split(os.path.sep)[:2]
-    image_dir = os.path.join(elements[0], 'images', file_name + '.jpg')
-    with open(txtfile, 'r') as file:
+# Path to images and annotations
+path_images = "Dataset_combined/images/"
+path_annot = "Dataset_combined/labels/"
+
+def parse_file(textfile):
+    file_name = os.path.splitext(os.path.basename(textfile))[0]
+    image_dir = path_images+file_name + '.jpg'
+    with open(textfile, 'r') as file:
         lines = file.readlines()
         boxes = []
         classes = []
@@ -39,11 +42,53 @@ def parse_file(txtfile):
             width = float(elements[3])
             height = float(elements[4])
             boxes.append([x, y, width, height])
-    return image_dir, classes, boxes
+    return image_dir, boxes, classes
+
+# Get all XML file paths in path_annot and sort them
+txt_files = sorted(
+    [
+        os.path.join(path_annot, file_name)
+        for file_name in os.listdir(path_annot)
+        if file_name.endswith(".txt")
+    ]
+)
+
+# Get all JPEG image file paths in path_images and sort them
+jpg_files = sorted(
+    [
+        os.path.join(path_images, file_name)
+        for file_name in os.listdir(path_images)
+        if file_name.endswith(".jpg")
+    ]
+)
+
+image_paths = []
+bbox = []
+classes = []
+for txtfile in tqdm(txt_files):
+    image_path, boxes, class_ids = parse_file(txtfile)
+    image_paths.append(image_path)
+    bbox.append(boxes)
+    classes.append(class_ids)
+
+bbox = tf.ragged.constant(bbox)
+classes = tf.ragged.constant(classes)
+image_paths = tf.ragged.constant(image_paths)
+
+data = tf.data.Dataset.from_tensor_slices((image_paths, classes, bbox))
+
+# Determine the number of validation samples
+num_val = int(len(txt_files) * SPLIT_RATIO)
+
+# Split the dataset into train and validation sets
+val_data = data.take(num_val)
+train_data = data.skip(num_val)
+
 
 def load_image(image_path):
     image = tf.io.read_file(image_path)
     image = tf.image.decode_jpeg(image, channels=3)
+    image = tf.image.resize(image, [640, 640])
     return image
 
 
@@ -57,97 +102,80 @@ def load_dataset(image_path, classes, bbox):
     return {"images": tf.cast(image, tf.float32), "bounding_boxes": bounding_boxes}
 
 
-
-train_annot_path = "Dataset_Combined/train/labels"
-
-train_annot_files = sorted([
-    os.path.join(train_annot_path, file_name)
-    for file_name in os.listdir(train_annot_path)
-    if file_name.endswith(".txt")
-])
-valid_annot_path = "Dataset_Combined/valid/labels"
-
-valid_annot_files = sorted([
-    os.path.join(valid_annot_path, file_name)
-    for file_name in os.listdir(valid_annot_path)
-    if file_name.endswith(".txt")
-])
-
-test_annot_path = "Dataset_Combined/test/labels"
-
-test_annot_files = sorted([
-    os.path.join(test_annot_path, file_name)
-    for file_name in os.listdir(test_annot_path)
-    if file_name.endswith(".txt")
-])
-
-train_image_paths = []
-train_bbox = []
-train_classes = []
-for txtfile in tqdm(train_annot_files):
-    image_path, boxes, class_ids = parse_file(txtfile)
-    train_image_paths.append(image_path)
-    train_bbox.append(boxes)
-    train_classes.append(class_ids)
-
-train_bbox = tf.ragged.constant(train_bbox)
-train_classes = tf.ragged.constant(train_classes)
-train_image_paths = tf.ragged.constant(train_image_paths)
-
-train_data = tf.data.Dataset.from_tensor_slices((train_image_paths, train_classes, train_bbox))
+augmenter = keras.Sequential(
+    layers=[
+        keras_cv.layers.RandomFlip(mode="horizontal", bounding_box_format="xyxy"),
+        keras_cv.layers.JitteredResize(
+            target_size=(640, 640),
+            scale_factor=(1.0, 1.0),
+            bounding_box_format="xyxy",
+        ),
+    ]
+)
 
 train_ds = train_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
 train_ds = train_ds.shuffle(BATCH_SIZE * 4)
 train_ds = train_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+train_ds = train_ds.map(augmenter, num_parallel_calls=tf.data.AUTOTUNE)
+
+resizing = keras_cv.layers.JitteredResize(
+    target_size=(640, 640),
+    scale_factor=(1.0, 1.0),
+    bounding_box_format="xyxy",
+)
+
+val_ds = val_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.shuffle(BATCH_SIZE * 4)
+val_ds = val_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+val_ds = val_ds.map(resizing, num_parallel_calls=tf.data.AUTOTUNE)
 
 
-valid_image_paths = []
-valid_bbox = []
-valid_classes = []
-for txtfile in tqdm(valid_annot_files):
-    image_path, boxes, class_ids = parse_file(txtfile)
-    valid_image_paths.append(image_path)
-    valid_bbox.append(boxes)
-    valid_classes.append(class_ids)
+def visualize_dataset(inputs, value_range, rows, cols, bounding_box_format):
+    inputs = next(iter(inputs.take(1)))
+    images, bounding_boxes = inputs["images"], inputs["bounding_boxes"]
+    visualization.plot_bounding_box_gallery(
+        images,
+        value_range=value_range,
+        rows=rows,
+        cols=cols,
+        y_true=bounding_boxes,
+        scale=5,
+        font_scale=0.7,
+        bounding_box_format=bounding_box_format,
+        class_mapping=class_mapping,
+    )
 
-valid_bbox = tf.ragged.constant(valid_bbox)
-valid_classes = tf.ragged.constant(valid_classes)
-valid_image_paths = tf.ragged.constant(valid_image_paths)
 
-valid_data = tf.data.Dataset.from_tensor_slices((valid_image_paths, valid_classes, valid_bbox))
+visualize_dataset(
+    train_ds, bounding_box_format="REL_XYWH", value_range=(0, 255), rows=2, cols=2
+)
 
-valid_ds = valid_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
-valid_ds = valid_ds.shuffle(BATCH_SIZE * 4)
-valid_ds = valid_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+visualize_dataset(
+    val_ds, bounding_box_format="REL_XYWH", value_range=(0, 255), rows=2, cols=2
+)
 
-test_image_paths = []
-test_bbox = []
-test_classes = []
-for txtfile in tqdm(test_annot_files):
-    image_path, boxes, class_ids = parse_file(txtfile)
-    test_image_paths.append(image_path)
-    test_bbox.append(boxes)
-    test_classes.append(class_ids)
 
-test_bbox = tf.ragged.constant(test_bbox)
-test_classes = tf.ragged.constant(test_classes)
-test_image_paths = tf.ragged.constant(test_image_paths)
+def dict_to_tuple(inputs):
+    return inputs["images"], inputs["bounding_boxes"]
 
-test_data = tf.data.Dataset.from_tensor_slices((test_image_paths, test_classes, test_bbox))
 
-test_ds = test_data.map(load_dataset, num_parallel_calls=tf.data.AUTOTUNE)
-test_ds = test_ds.shuffle(BATCH_SIZE * 4)
-test_ds = test_ds.ragged_batch(BATCH_SIZE, drop_remainder=True)
+train_ds = train_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
+train_ds = train_ds.prefetch(tf.data.AUTOTUNE)
+
+val_ds = val_ds.map(dict_to_tuple, num_parallel_calls=tf.data.AUTOTUNE)
+val_ds = val_ds.prefetch(tf.data.AUTOTUNE)
 
 backbone = keras_cv.models.YOLOV8Backbone.from_preset(
-    "yolo_v8_s_backbone"  # We will use yolov8 small backbone with coco weights
+    "yolo_v8_s_backbone_coco",
+    load_weights=True,
+    input_shape=(640, 640, 3)
 )
 
 yolo = keras_cv.models.YOLOV8Detector(
     num_classes=len(class_mapping),
     bounding_box_format="xyxy",
     backbone=backbone,
-    fpn_depth=1,
+    fpn_depth=3,
 )
 
 optimizer = tf.keras.optimizers.Adam(
@@ -159,9 +187,14 @@ yolo.compile(
     optimizer=optimizer, classification_loss="binary_crossentropy", box_loss="ciou"
 )
 
-yolo.fit(
+tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir="logs_yolov8small")
+
+history = yolo.fit(
     train_ds,
-    validation_data=valid_ds,
-    epochs=30,
-    callbacks=[EvaluateCOCOMetricsCallback(valid_ds, "model.h5")],
+    validation_data=val_ds,
+    epochs=EPOCH,
+    callbacks=[
+        EvaluateCOCOMetricsCallback(val_ds, "model_yolov8small.h5"),
+        tensorboard_callback
+    ],
 )
